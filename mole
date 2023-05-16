@@ -1,0 +1,390 @@
+#!/bin/bash
+# Janos Laszlo Vasik, xvasik05
+
+export POSIXLY_CORRECT=yes
+LC_CTYPE=C
+
+# function to print to stderr
+echoErr(){ echo "$@" 1>&2; }
+
+# funciton that prints the help 
+print_help() {
+    echo "Usage:    mole [-h]"
+    echo "          mole [-g GROUP] FILE"
+    echo "          mole [-m] [FILTERS] [DIRECTORY]"
+    echo "          mole list [FILTERS] [DIRECTORY]"
+    echo ""
+    echo "          -h          give this help list"
+    echo "          -g          add chosen FILE to GROUP"
+    echo "          -m          open the most frequently edited file"
+    echo "          list        print list of files opened in the specified directory"
+    echo ""
+    echo "FILE:         file to open."
+    echo ""
+    echo "[-g GROUP]:   adds opened file to user specified GROUP. (if chosen GROUP is new, it is created)"
+    echo ""
+    echo "[DIRECTORY]:  opens a file from specified directory."
+    echo "              If not specified, the current directory is chosen."
+    echo ""
+    echo "[FILTERS]:    limits openable files with the following filters:"
+    echo "                  [-g GROUP1[,GROUP2[,...]]]  -  if file isn't in at least on of given GROUPS, it is ignored."
+    echo "                  [-a DATE]                   -  logs after given date are ignored."
+    echo "                  [-b DATE]                   -  logs before given date are ignored."
+    echo "DATE:         accepted format: YYYY-MM-DD"
+}
+
+##################### checking for valid output config #####################
+
+if [ -v MOLE_RC ]; then # if MOLE_RC is defined
+    if [ ! -f "$MOLE_RC" ]; then # if file or path doesn't exist, create it
+        mkdir -p "$(dirname "$MOLE_RC")" && touch "${MOLE_RC}"
+    fi  
+else
+    echoErr "The MOLE_RC variable is not set, please define the output address."
+    exit 1
+fi
+
+##################### checking for valid editor config #####################
+
+editor=""
+
+if [ -v EDITOR ]; then # if EDITOR is defined
+    editor="$EDITOR"
+    if ! command -v "$editor" &> /dev/null; then
+        echoErr "The variable stored editor does not exist on the system. Please set \$EDITOR or \$VISUAL correctly."
+        exit 1
+    fi
+else
+    if [ -v VISUAL ]; then # if EDITOR is defined
+        editor="$VISUAL"
+        if ! command -v "$editor" &> /dev/null; then
+            echoErr "The variable stored editor does not exist on the system. Please set \$EDITOR or \$VISUAL correctly."
+            exit 1
+        fi
+    else
+        editor="vi" # else fallback to vi
+    fi
+fi
+
+##################### checking for existence of realpath #####################
+
+if ! command -v realpath &> /dev/null; then # if realpath is not installed
+    echoErr "The 'realpath' utility is not installed. Please install realpath and try again."
+    exit 1
+fi
+
+##################### parsing options #####################
+
+op="edit"
+
+while getopts ':hma:b:g:' option; do
+    case "$option" in
+        a)
+            after="$OPTARG"
+        ;;
+        b)
+            before="$OPTARG"
+        ;;
+        h)
+            print_help
+            exit 0
+        ;;
+        g)
+            group=$OPTARG
+            multiG=$(echo "$group" | grep ",")
+        ;;
+        m)
+            op="most"
+        ;;
+        :)
+            echo "Missing required parameters. (probably for option -g, -a or -b)"
+            exit 1
+        ;;
+        ?)
+            echoErr "Unknown option '${OPTARG}', please only use the following: h g m"
+            exit 1
+        ;;
+    esac
+done 
+shift $((OPTIND-1))
+
+##################### parsing parameters #####################
+
+target_t="dir"
+target="$(pwd)"
+
+while [ "$#" -gt 0 ]; do 
+    case "$1" in
+        list)
+            if [ "$op" != "edit" ]; then
+                echoErr "Wrong parameter and option combination used. See 'mole -h' for correct usage."
+                exit 1
+            fi 
+            op="list"
+            shift
+        ;;
+        secret-log)
+            if [ "$op" != "edit" ] || [ -v after ] || [ -v before ]; then # before and after can only be after secret-log
+                echoErr "Wrong parameter and option combination used. See 'mole -h' for correct usage."
+                exit 1
+            fi 
+            op="secret-log"
+            shift
+            # checking for filters
+            while getopts ':a:b:' option; do
+                case "$option" in
+                    a)
+                        after="$OPTARG"
+                    ;;
+                    b)
+                        before="$OPTARG"
+                    ;;
+                    :)
+                        echo "Missing required parameters. (probably for option -a or -b)"
+                        exit 1
+                    ;;
+                    ?)
+                        echoErr "Unknown option '${OPTARG}', please only use the following: a b"
+                        exit 1
+                    ;;
+                esac
+            done 
+            shift $((OPTIND-1))
+        ;;
+        *)
+            # checking for type of target
+            if [ "$op" = "secret-log" ]; then # don't consume target
+                break
+            else
+                target=$(realpath "$1")
+                if [ ! -d "$target" ]; then # if target is not existing directory, treat it as a file
+                    target_t="file"
+                    if [ -v before ] || [ -v after ] || [ "$op" != "edit" ]; then # testing bad argumant combinations
+                        echoErr "Wrong parameter and option combination used. See 'mole -h' for correct usage."
+                        exit 1
+                    fi
+                    if [ "$multiG" != "" ]; then # testing one group only when target is file
+                        echoErr "Not allowed characters in [GROUP]. Please don't use special characters."
+                        exit 1
+                    fi
+                fi
+                shift
+                break
+            fi
+        ;;
+    esac
+done
+
+##################### secret-log targeting #####################
+
+if [ "$op" = "secret-log" ]; then
+    if [ "$#" -gt 0 ]; then # targets left
+        while [ "$#" -gt 0 ]; do 
+            dirs=$(printf "%s;%s" "$(realpath "$1")" "$dirs")
+            shift
+        done
+    fi
+fi
+
+##################### logger func  #####################
+
+# logger and editor function 
+logger_editor () {
+    date=$(date +"%Y-%m-%d_%H-%M-%S")
+    if [ "$target_t" = "file" ]; then
+        if [ -v group ]; then
+            printf "%s;%s;%s\n" "$target" "$group" "$date" >> "${MOLE_RC}" # logging with adding group (only possible with file paths, and defined group)
+        else
+            printf "%s;%s;%s\n" "$target" "-" "$date" >> "${MOLE_RC}" # logging with adding group (only possible with file paths)
+        fi        
+    else
+        printf "%s;%s;%s\n" "$target" "-" "$date" >> "${MOLE_RC}" # logging with no group
+    fi
+
+    $editor "$target" # opening editor
+    ret="$?"
+
+    if [ "$ret" -ne 0 ]; then # editing failed
+        echoErr "The editor returned an error. Please try again."
+        exit "$ret"
+    fi
+}
+
+##################### base case - file editing #####################
+
+if [ "$target_t" = "file" ]; then
+    logger_editor # logging, editing
+    exit 0
+fi
+
+##################### directory as target #####################
+
+########## targeting dirs, filtering ##########
+
+log=$(cat "$MOLE_RC")
+
+# targeting path(s)
+if [ "$op" = "secret-log" ]; then
+    if [ "$dirs" != "" ]; then # include logs of all dirs given by call parameters
+        while [ "$dirs" != "" ]; do
+            currDir=$(printf "%s" "$dirs" | sed 's/;.*//')
+
+            # adding files associated with currDir to currLog
+            currLog=$(printf "%s" "$log" | awk -F ';' -v target="^$currDir/[A-z0-9._]*$" '$1 ~ target')
+
+            if [ "$currLog" != "" ]; then
+                tmpLog=$(printf "%s\n%s" "$tmpLog" "$currLog")
+            fi
+
+            dirs=$(printf "%s" "$dirs" | sed 's/[^;]*;//') # omitting used dir path
+        done
+        log=$(printf "%s" "$tmpLog" | awk 'NR>1') # deleting empty first line and overwriting $log
+    fi
+else
+    log=$(printf "%s" "$log" | awk -F ';' -v target="^$target/[A-z0-9._]*$" '$1 ~ target')
+fi
+
+# filtering
+if [ -v after ]; then
+    log=$(printf "%s" "$log" | awk -F ';' -v after="$after" '$3 >= after')
+fi
+
+if [ -v before ]; then
+    log=$(printf "%s" "$log" | awk -F ';' -v before="$before" '$3 <= before')
+fi
+
+if [ -v group ]; then
+    # in case of multiple group filters, we iterate through and append them to a new log  
+    if [ "$multiG" != "" ]; then
+        for i in $(echo "$group" | tr ',' ' '); do # for each group
+            tmpLog="$(echo "$log" | awk -F ';' -v group="^$i$" '$2 ~ group')"$'\n'
+            newLog="$(printf "%s%s" "$newLog" "$tmpLog")"
+        done
+        log="$(echo "$newLog" | head -c -1)" # overwriting original and omitting trailing newline (there's probably better ways to do this)
+    else # only 1 or 0 group filters
+        log=$(printf "%s" "$log" | awk -F ';' -v group="^$group$" '$2 ~ group')
+    fi
+fi
+
+########## choosing target file in dir and performing function ##########
+
+if [ "$op" = "edit" ]; then # edit last opened file in folder
+    i=1
+    maxLines=$(echo "$log" | wc -l)
+    while true; do
+        # finding the first from last opened i files in target dir
+        currTarg=$(printf "%s" "$log" | awk -F ';' '{print $1}' | tail -n "$i" | head -n 1)
+        if [ ! -f "$currTarg" ]; then # if current file has been deleted
+            if [ "$i" -eq "$maxLines" ]; then # and there are no more records, stop
+                target=""
+                break
+            fi
+        else
+            target="$currTarg"
+            break
+        fi
+        i=$((i+1))
+    done
+    
+    # checking for existence of target
+    if [ "$target" = "" ]; then
+        echoErr "No previously edited file in folder. Please specify the target!"
+        exit 1
+    fi
+    
+    logger_editor # logging, editing
+
+elif [ "$op" = "most" ]; then # edit most opened file in folder
+    i=1
+    maxLines=$(echo "$log" | awk -F ';' '{print $1}' | sort | uniq -c | sort -rn | wc -l)
+    while true; do
+        # print first column, sort (so uniq counts files together), find number of occurences, sort by descending, print first found path (most occuring)
+        currTarg=$(printf "%s" "$log" | awk -F ';' '{print $1}' | sort | uniq -c | sort -rn | awk -v counter="$i" 'NR==counter {print $2}' | xargs)
+        if [ ! -f "$currTarg" ]; then # if current file has been deleted
+            if [ "$i" -eq "$maxLines" ]; then # and there are no more records, stop
+                target=""
+                break
+            fi
+        else
+            target="$currTarg"
+            break
+        fi
+        i=$((i+1)) 
+    done
+
+    # checking for existence of target
+    if [ "$target" = "" ]; then
+        echoErr "No previously edited file in folder. Please specify the target!"
+        exit 1
+    fi
+
+    logger_editor # logging, editing
+
+elif [ "$op" = "list" ]; then # print list of edited files and their corresponding groups
+    log=$(printf "%s" "$log" | awk -F ';' '{print $1 ";" $2}'| sort -d -t ';' -k 1 | uniq) # only lines with unique file or group names persist
+    maxLines=$(printf "%s" "$log" | awk -F ';' '{print $1}' | sort | uniq -c | wc -l) # number of output lines
+    i=1
+
+    # first calculating the longest filename
+    maxCount=0
+    for fLine in $log; do
+        currCount=$(echo "$fLine" | awk -F ';' '{print $1}' | wc -m)
+        if [ "$currCount" -gt "$maxCount" ]; then
+            maxCount="$currCount"
+        fi 
+    done
+
+    # creating output lines
+    while true; do # for each unique path
+        currFile=$(printf "%s" "$log" | awk -F ';' 'NR==1 {print $1}') # choosing a filepath
+        currGroups=$(printf "%s" "$log" | awk -F ';' -v file="^$currFile$" '$1 ~ file{printf "%s,", $2}' | head -c -1) # all groups that file is in
+        if [ "$currGroups" != "-" ]; then # if not empty, have to remove '-' from groups list (it's always the first)
+            currGroups=$(printf "%s" "$currGroups" | sed 's/^\(-,\)//')
+        fi
+        
+        charCount=$(printf "%s" "$currFile" | wc -m) # number of characters in filepath (needed for indenting)
+        spaces=""
+        
+        missingChar=$((maxCount-charCount)) # number of extra ' ' needed on this line
+        for ((x=1; x<=missingChar; x++)); do
+            spaces=$(printf "%s" "$spaces")$' '
+        done
+        
+        if [ "$i" -gt "$maxLines" ]; then # reached EOF
+            break
+        fi
+        fileName=$(printf "%s" "$currFile" | sed 's/.*\///')
+        currLine=$(printf "%s:%s%s" "$fileName" "$spaces" "$currGroups")
+        listLog=$(printf "%s%s" "$listLog" "$currLine")$'\n'
+        i=$((i+1))
+        log=$(printf "%s" "$log" | awk -F ';' -v target="^$currFile$" '$1 !~ target') # deleting used lines 
+    done
+    printf "%s" "$listLog"
+
+    # After coding this path, I'd like to formally apologize to anyone who reads this. It works though.
+
+elif [ "$op" = "secret-log" ]; then # secret log
+    log=$(printf "%s" "$log" | sort)
+
+    while [ "$log" != "" ]; do 
+        currFile=$(printf "%s" "$log" | awk -F ';' 'NR==1 {print $1}') # choosing a filepath
+        currTimes=$(printf "%s" "$log" | awk -F ';' -v file="^$currFile$" '$1 ~ file{printf ";%s", $3}') # all timestamps for file
+        currLine=$(printf "%s%s" "$currFile" "$currTimes") # formatting current line
+        secretLog=$(printf "%s%s" "$secretLog" "$currLine")$'\n' # appending current line
+
+        log=$(printf "%s" "$log" | awk -F ';' -v target="^$currFile$" '$1 !~ target') # deleting used lines 
+    done
+    
+###################### making secret log file and dir ####################
+
+    # name creation
+    date=$(date +"%Y-%m-%d_%H-%M-%S")
+    tarDir="$HOME/.mole"
+    target="${tarDir}/log_${USER}_${date}"
+    
+    mkdir -p "$tarDir"
+    
+    printf "%s" "$secretLog" | bzip2 -c > "$target".bz2
+fi
+
+exit 0
